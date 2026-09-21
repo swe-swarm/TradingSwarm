@@ -1,18 +1,29 @@
 """ACP adapter contract and real NDJSON transport tests (no network service)."""
 
 import asyncio
+import io
 import json
 import socket
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from acp import PROTOCOL_VERSION, RequestError, run_agent, schema as s
-from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
-from copilot.generated.session_events import PermissionRequestRead, SessionEvent
 
 from tradingswarm import acp
+
+pytest.importorskip("acp")
+pytest.importorskip("copilot")
+
+from acp import PROTOCOL_VERSION, RequestError, run_agent, schema as s  # noqa: E402
+from copilot import GetAuthStatusResponse  # noqa: E402
+from copilot.generated.rpc import (  # noqa: E402
+    PermissionDecisionApproveOnce,
+    PermissionDecisionReject,
+)
+from copilot.generated.session_events import PermissionRequestRead, SessionEvent  # noqa: E402
 
 
 def text(value):
@@ -35,7 +46,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(acp.TradingSwarmSession, "create", create)
     auth = SimpleNamespace(
         start=AsyncMock(), stop=AsyncMock(),
-        get_auth_status=AsyncMock(return_value=SimpleNamespace(isAuthenticated=True)),
+        get_auth_status=AsyncMock(return_value=GetAuthStatusResponse(isAuthenticated=True)),
     )
     monkeypatch.setattr(acp, "CopilotClient", MagicMock(return_value=auth))
     client = SimpleNamespace(session_update=AsyncMock(), request_permission=AsyncMock())
@@ -104,6 +115,68 @@ def test_rejects_unsupported_session_configuration(setup, kwargs):
     asyncio.run(check())
 
 
+def stdio_server(**overrides):
+    return s.McpServerStdio(**{
+        "name": "research", "command": sys.executable, "args": ["-m", "research_mcp"],
+        "env": [], **overrides,
+    })
+
+
+def test_stdio_mcp_mapping_passes_only_explicit_client_configuration(setup):
+    assert "_research" in acp._mcp_config([stdio_server(name="_research")])
+
+    async def check():
+        await setup.agent.initialize(1)
+        await setup.agent.new_session(
+            str(acp.Path.cwd()), mcp_servers=[
+                stdio_server(env=[s.EnvVariable(name="DATA_SOURCE", value="public")]),
+                stdio_server(name="filings", args=["--read-only"]),
+            ],
+        )
+        assert setup.create.await_args.kwargs["mcp_servers"] == {
+            "research": {
+                "type": "local", "command": sys.executable, "args": ["-m", "research_mcp"],
+                "env": {"DATA_SOURCE": "public"}, "tools": ["*"],
+            },
+            "filings": {
+                "type": "local", "command": sys.executable, "args": ["--read-only"],
+                "env": {}, "tools": ["*"],
+            },
+        }
+        setup.client.request_permission.assert_not_awaited()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("servers", [
+    [stdio_server(name="")],
+    [stdio_server(name="*")],
+    [stdio_server(name="research.files")],
+    [stdio_server(), stdio_server()],
+    [stdio_server(command="python")],
+    [stdio_server(command="./server")],
+    [stdio_server(command="/server\0")],
+    [stdio_server(args=["bad\0arg"])],
+    [stdio_server(env=[s.EnvVariable(name="X", value="1"), s.EnvVariable(name="X", value="2")])],
+    [stdio_server(env=[s.EnvVariable(name="", value="1")])],
+    [stdio_server(env=[s.EnvVariable(name="INVALID=NAME", value="1")])],
+    [stdio_server(env=[s.EnvVariable(name="VALID_NAME", value="bad\0value")])],
+    [s.HttpMcpServer(type="http", name="remote", url="https://example.com", headers=[])],
+    [s.SseMcpServer(type="sse", name="remote", url="https://example.com", headers=[])],
+    [s.AcpMcpServer(type="acp", name="remote", server_id="remote-id")],
+])
+def test_stdio_mcp_rejects_unsafe_or_invalid_configuration(setup, servers):
+    async def check():
+        await setup.agent.initialize(1)
+        with pytest.raises(RequestError) as error:
+            await setup.agent.new_session(str(acp.Path.cwd()), mcp_servers=servers)
+        assert error.value.code == -32602
+        setup.create.assert_not_awaited()
+        setup.auth.start.assert_not_awaited()
+
+    asyncio.run(check())
+
+
 def test_authentication_uses_existing_cli_login(setup):
     async def check():
         await setup.agent.initialize(1)
@@ -114,10 +187,36 @@ def test_authentication_uses_existing_cli_login(setup):
         assert "copilot login" in error.value.data["message"]
         setup.create.assert_not_awaited()
         setup.auth.stop.assert_awaited_once()
-        acp.CopilotClient.assert_called_once_with(use_logged_in_user=True)
+        acp.CopilotClient.assert_called_once_with()
         with pytest.raises(RequestError) as error:
             await setup.agent.authenticate("token")
         assert error.value.code == -32602
+    asyncio.run(check())
+
+
+def test_authentication_preserves_sdk_environment_token_auth(setup, monkeypatch):
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-environment-auth")
+
+    async def check():
+        setup.auth.get_auth_status.return_value = GetAuthStatusResponse(
+            isAuthenticated=True, authType="token",
+        )
+        await new_session(setup)
+        acp.CopilotClient.assert_called_once_with()
+        setup.create.assert_awaited_once()
+        setup.auth.stop.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+def test_agent_version_uses_distribution_metadata_with_source_checkout_fallback(setup, monkeypatch):
+    async def check():
+        monkeypatch.setattr(acp, "version", MagicMock(return_value="0.5.1"))
+        assert (await setup.agent.initialize(1)).agent_info.version == "0.5.1"
+        acp.version.assert_called_once_with("tradingswarm")
+        monkeypatch.setattr(acp, "version", MagicMock(side_effect=acp.PackageNotFoundError))
+        assert (await setup.agent.initialize(1)).agent_info.version == "0.5.0"
+
     asyncio.run(check())
 
 
@@ -135,7 +234,6 @@ def test_auth_failure_cleanup_does_not_hide_auth_required(setup):
 @pytest.mark.parametrize("blocks", [
     [], text(" "), text("/fleet"), text("/unknown task"),
     [s.ImageContentBlock(type="image", data="aGVsbG8=", mime_type="image/png")],
-    [*text("read"), s.ResourceContentBlock(type="resource_link", uri="file:///private", name="file")],
 ])
 def test_rejects_unsupported_prompt_content(setup, blocks):
     async def check():
@@ -144,6 +242,51 @@ def test_rejects_unsupported_prompt_content(setup, blocks):
             await setup.agent.prompt(sid, blocks)
         assert error.value.code == -32602
         setup.runtime.prompt.assert_not_awaited()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("uri", [
+    "file:///evidence/report.txt", "https://example.com/report", "research:report-123",
+])
+def test_baseline_resource_links_preserve_metadata_without_fetching(setup, uri):
+    async def check():
+        sid = await new_session(setup)
+        link = s.ResourceContentBlock(
+            type="resource_link", uri=uri, name="Quarterly report",
+            description="Research context", mime_type="text/plain", size=123,
+        )
+        response = await setup.agent.prompt(sid, [*text("Consider this reference"), link])
+        assert response.stop_reason == "end_turn"
+        submitted = setup.runtime.prompt.await_args.args[0]
+        assert submitted.startswith("Consider this reference\n")
+        assert "contents have not been fetched" in submitted
+        context = json.loads(submitted.splitlines()[-1])
+        assert context == {
+            "uri": uri, "name": "Quarterly report", "description": "Research context",
+            "mimeType": "text/plain", "size": 123,
+        }
+        setup.client.request_permission.assert_not_awaited()
+        await setup.agent.prompt(sid, [link])
+        assert uri in setup.runtime.prompt.await_args.args[0]
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("uri", [
+    "report.txt", "../report.txt", "/absolute/path", "file:relative.txt",
+    "file://hostname", "C:relative.txt", "https:relative", "https://[invalid",
+    "https://example.com/unsafe\npath",
+])
+def test_resource_links_reject_relative_paths_and_invalid_uris(setup, uri):
+    async def check():
+        sid = await new_session(setup)
+        with pytest.raises(RequestError) as error:
+            await setup.agent.prompt(sid, [
+                s.ResourceContentBlock(type="resource_link", uri=uri, name="Resource"),
+            ])
+        assert error.value.code == -32602
+        setup.runtime.prompt.assert_not_awaited()
+
     asyncio.run(check())
 
 
@@ -275,12 +418,14 @@ def test_cancel_inflight_prompt_and_pending_permission(setup):
         running = asyncio.Event()
         permission_started = asyncio.Event()
         permission_result = []
+        callbacks = []
 
         async def ask_permission(**kwargs):
             permission_started.set()
             await asyncio.Event().wait()
 
         async def long_prompt(value, *, fleet, on_event):
+            callbacks.append(on_event)
             running.set()
             permission_result.append(await setup.create.await_args.kwargs["on_permission_request"](
                 PermissionRequestRead(intention="Read", path="/evidence"), {},
@@ -300,6 +445,10 @@ def test_cancel_inflight_prompt_and_pending_permission(setup):
         assert (await asyncio.wait_for(turn, 1)).stop_reason == "cancelled"
         setup.runtime.abort.assert_awaited_once()
         assert not setup.agent.sessions[sid].lock.locked()
+        update_count = setup.client.session_update.await_count
+        callbacks[0](event("assistant.message_delta", messageId="late", deltaContent="late output"))
+        await asyncio.sleep(0)
+        assert setup.client.session_update.await_count == update_count
         setup.runtime.prompt.side_effect = None
         assert (await setup.agent.prompt(sid, text("continue"))).stop_reason == "end_turn"
     asyncio.run(check())
@@ -386,7 +535,9 @@ async def transport(agent):
     left, right = socket.socketpair()
     reader, writer = await asyncio.open_connection(sock=left)
     agent_reader, agent_writer = await asyncio.open_connection(sock=right)
-    task = asyncio.create_task(run_agent(agent, agent_writer, agent_reader))
+    task = asyncio.create_task(run_agent(
+        agent, input_stream=agent_writer, output_stream=agent_reader,
+    ))
 
     class Wire:
         async def send(self, message):
@@ -431,12 +582,16 @@ def test_official_transport_initialize_new_mode_and_invalid_request(setup):
             assert "result" in await wire.response(3)
             await wire.send({
                 "id": 4, "method": "session/prompt",
-                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "research"}]},
+                "params": {"sessionId": sid, "prompt": [
+                    {"type": "text", "text": "research"},
+                    {"type": "resource_link", "uri": "file:///evidence", "name": "Evidence"},
+                ]},
             })
             update = await wire.read()
             assert update["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
             assert (await wire.response(4))["result"]["stopReason"] == "end_turn"
             assert setup.runtime.prompt.await_args.kwargs["fleet"] is True
+            assert '"uri": "file:///evidence"' in setup.runtime.prompt.await_args.args[0]
             await wire.send({"id": 5, "method": "session/prompt", "params": {}})
             assert (await wire.response(5))["error"]["code"] == -32602
             await wire.send({"id": 6, "method": "not/a/method", "params": {}})
@@ -469,6 +624,39 @@ def test_official_transport_cancel_during_inflight_turn(setup):
             await wire.send({"method": "session/cancel", "params": {"sessionId": sid}})
             assert (await wire.response(3))["result"]["stopReason"] == "cancelled"
             setup.runtime.abort.assert_awaited_once()
+    asyncio.run(check())
+
+
+def test_official_transport_accepts_baseline_stdio_mcp_configuration(setup):
+    async def check():
+        async with transport(setup.agent) as wire:
+            await wire.send({"id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+            await wire.response(1)
+            await wire.send({
+                "id": 2, "method": "session/new",
+                "params": {"cwd": str(acp.Path.cwd()), "mcpServers": [{
+                    "name": "research", "command": sys.executable, "args": ["--read-only"],
+                    "env": [{"name": "DATA_SOURCE", "value": "public"}],
+                }]},
+            })
+            assert "sessionId" in (await wire.response(2))["result"]
+            assert setup.create.await_args.kwargs["mcp_servers"]["research"] == {
+                "type": "local", "command": sys.executable, "args": ["--read-only"],
+                "env": {"DATA_SOURCE": "public"}, "tools": ["*"],
+            }
+            for request_id, invalid in enumerate([
+                {"args": [123]}, {"env": [{"name": "DATA_SOURCE", "value": 123}]},
+            ], start=3):
+                await wire.send({
+                    "id": request_id, "method": "session/new",
+                    "params": {"cwd": str(acp.Path.cwd()), "mcpServers": [{
+                        "name": "research", "command": sys.executable, "args": [], "env": [],
+                        **invalid,
+                    }]},
+                })
+                assert (await wire.response(request_id))["error"]["code"] == -32602
+            setup.create.assert_awaited_once()
+
     asyncio.run(check())
 
 
@@ -513,8 +701,8 @@ def test_stdio_routes_runtime_prints_to_stderr_and_closes_on_failure(monkeypatch
         agent = SimpleNamespace(shutdown=AsyncMock())
         monkeypatch.setattr(acp, "TradingSwarmAgent", MagicMock(return_value=agent))
 
-        async def transport_runner(actual_agent, actual_writer, actual_reader):
-            assert (actual_agent, actual_writer, actual_reader) == (agent, writer, reader)
+        async def transport_runner(actual_agent, *, input_stream, output_stream):
+            assert (actual_agent, input_stream, output_stream) == (agent, writer, reader)
             print("vendor diagnostic")
             raise RuntimeError("transport closed")
 
@@ -527,3 +715,124 @@ def test_stdio_routes_runtime_prints_to_stderr_and_closes_on_failure(monkeypatch
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "vendor diagnostic\n"
+
+
+def test_windows_dynamic_stdout_transport_stays_bound_to_protocol_output(monkeypatch):
+    async def check():
+        protocol_bytes = io.BytesIO()
+        diagnostic_bytes = io.BytesIO()
+        stdout = io.TextIOWrapper(protocol_bytes, encoding="utf-8")
+        stderr = io.TextIOWrapper(diagnostic_bytes, encoding="utf-8")
+        monkeypatch.setattr(sys, "stdout", stdout)
+        monkeypatch.setattr(sys, "stderr", stderr)
+        monkeypatch.setattr(acp.platform, "system", lambda: "Windows")
+
+        class DynamicStdoutTransport(asyncio.WriteTransport):
+            def __init__(self):
+                self.closed = False
+
+            def write(self, data):
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+
+            def is_closing(self):
+                return self.closed
+
+            def close(self):
+                self.closed = True
+
+        native_transport = DynamicStdoutTransport()
+        writer = asyncio.StreamWriter(
+            native_transport, SimpleNamespace(_drain_helper=AsyncMock()),
+            None, asyncio.get_running_loop(),
+        )
+        reader = asyncio.StreamReader()
+        monkeypatch.setattr(acp, "stdio_streams", AsyncMock(return_value=(reader, writer)))
+        agent = SimpleNamespace(shutdown=AsyncMock())
+        monkeypatch.setattr(acp, "TradingSwarmAgent", MagicMock(return_value=agent))
+
+        async def transport_runner(actual_agent, *, input_stream, output_stream):
+            print("vendor diagnostic")
+            input_stream.write(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+            await input_stream.drain()
+            input_stream.close()
+
+        monkeypatch.setattr(acp, "run_agent", transport_runner)
+        await acp.serve()
+        stderr.flush()
+        assert protocol_bytes.getvalue() == b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+        assert diagnostic_bytes.getvalue() == b"vendor diagnostic\n"
+        agent.shutdown.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("block", ["acp", "copilot", "python310"])
+def test_core_only_entry_point_imports_and_reports_installation_help(block):
+    script = """
+import builtins
+import sys
+blocked = sys.argv[1]
+original_import = builtins.__import__
+def safe_import(name, *args, **kwargs):
+    if name == blocked or name.startswith(blocked + "."):
+        raise ImportError("optional package unavailable")
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = safe_import
+if blocked == "python310":
+    sys.version_info = (3, 10, 19)
+from tradingswarm.acp import main
+main()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, block], capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert 'Python 3.11+ and pip install "tradingswarm[acp]"' in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_real_stdio_subprocess_only_emits_jsonrpc_and_never_answers_notifications():
+    async def check():
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "tradingswarm.acp",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def send(message):
+            process.stdin.write((json.dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+            await process.stdin.drain()
+
+        async def receive():
+            response = json.loads(await asyncio.wait_for(process.stdout.readline(), 5))
+            assert response["jsonrpc"] == "2.0"
+            return response
+
+        try:
+            await send({"id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+            initialized = await receive()
+            assert initialized["id"] == 1
+            assert initialized["result"]["protocolVersion"] == 1
+            await send({"method": "session/cancel", "params": {"sessionId": "unknown"}})
+            await send({"id": 2, "method": "session/prompt", "params": {}})
+            invalid = await receive()
+            assert invalid["id"] == 2
+            assert invalid["error"]["code"] == -32602
+            await send({"id": 3, "method": "unsupported/method", "params": {}})
+            unknown = await receive()
+            assert unknown["id"] == 3
+            assert unknown["error"]["code"] == -32601
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(process.stdout.readline(), 0.1)
+            process.stdin.close()
+            await asyncio.wait_for(process.wait(), 5)
+            assert process.returncode == 0, (await process.stderr.read()).decode()
+            assert await process.stdout.read() == b""
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+    asyncio.run(check())

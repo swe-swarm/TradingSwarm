@@ -128,6 +128,18 @@ def test_factory_catalog_and_github_auth(provider, sdk):
     assert get_model_options(provider, "quick") == [("Custom model ID", "custom")]
 
 
+@pytest.mark.parametrize("provider", ["copilot", "github"])
+def test_cli_does_not_prompt_for_or_reuse_provider_api_keys(monkeypatch, provider):
+    import cli.utils as cli_utils
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unrelated-provider-placeholder")
+    password = Mock(side_effect=AssertionError("Copilot must not prompt for a provider API key"))
+    monkeypatch.setattr(cli_utils.questionary, "password", password)
+    assert cli_utils.ensure_api_key(provider) is None
+    password.assert_not_called()
+    assert ("GitHub Copilot (GitHub account)", "copilot", None) in cli_utils._llm_provider_table()
+
+
 def test_optional_sdk_error_is_actionable(monkeypatch):
     monkeypatch.setitem(sys.modules, "copilot", None)
     client = create_llm_client("copilot", "model")

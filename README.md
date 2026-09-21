@@ -74,9 +74,18 @@ go to stderr. Financial evidence uses the existing dated data vendors; sentiment
 currently uses news evidence, not invented social posts. Missing historical data
 must be reported, not filled in. Fleet is a separate research workflow, not a
 replacement for LangGraph's checkpoint, backtest, portfolio or decision-log APIs.
-No orders are placed. Only `task`, `sql`, and read-only `trading_evidence` tools
-are enabled; local shell/file tools, discovered instructions, skills and file
-hooks are disabled. External MCP servers are rejected rather than silently ignored.
+Built-in TradingSwarm tools never place orders. Only session orchestration tools (`task`, `sql`,
+`read_agent`, `write_agent`, `list_agents`, `task_complete`) and read-only
+`trading_evidence` are enabled. Evidence is bound to the user's explicit
+`as of YYYY-MM-DD` cutoff (or the sole ISO date in a prompt), retained across
+follow-up turns. Ambiguous dates require clarification; model-supplied dates
+cannot override the cutoff. Local shell/file tools, discovered instructions, skills and file
+hooks are disabled. ACP clients may explicitly configure stdio MCP servers;
+their tools are additionally available to the parent session and subject to
+permission handling. This deliberately grants the configured executable access
+to the agent's host environment: only configure trusted MCP servers.
+Cancellation stops the agent turn, but an already-running synchronous vendor
+request may finish in its background thread.
 
 ### Agent Client Protocol
 
@@ -101,7 +110,9 @@ client approval; absent or invalid responses do not grant access.
 
 Capabilities are negotiated, not assumed. This integration is a text research
 agent: it does not advertise image/audio input, client filesystem/terminal
-operations or persistent session loading. Unsupported features return protocol
+operations or persistent session loading. Client-provided stdio MCP servers are
+supported; executable paths must be absolute, with unique server/environment
+names. HTTP/SSE MCP transports are not advertised or accepted. Unsupported features return protocol
 errors. Authentication uses the existing Copilot login outside ACP. Generic SDK
 events, rather than nonexistent dedicated SDK subagent hooks, carry lifecycle
 activity. Plugin sub-agents are not registered by this adapter.

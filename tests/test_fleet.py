@@ -4,7 +4,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from tradingswarm.fleet import TradingSwarmSession, _evidence, _trading_tool
+from tradingswarm.fleet import (
+    _ORCHESTRATION_TOOLS,
+    TradingSwarmSession,
+    _evidence,
+    _trading_tool,
+)
 
 pytest.importorskip("copilot")
 
@@ -134,11 +139,12 @@ def test_create_restricts_tools_and_configuration(tmp_path):
             await TradingSwarmSession.create(cwd=str(tmp_path))
         kwargs = client.create_session.call_args.kwargs
         assert kwargs["available_tools"].to_list() == [
-            "builtin:task", "builtin:sql", "custom:trading_evidence",
+            *[f"builtin:{name}" for name in _ORCHESTRATION_TOOLS], "custom:trading_evidence",
         ]
-        assert kwargs["excluded_tools"].to_list() == ["mcp:*"]
+        assert not any(tool.startswith("mcp:") for tool in kwargs["available_tools"])
         assert kwargs["enable_config_discovery"] is False
         assert kwargs["enable_file_hooks"] is False
+        assert "general-purpose" in kwargs["excluded_builtin_agents"]
         assert "provider" not in kwargs
         assert len(kwargs["custom_agents"]) == 8
         assert kwargs["on_permission_request"](None, {}).kind == "reject"
@@ -152,11 +158,25 @@ def test_create_failure_stops_client(tmp_path):
     client.stop.assert_awaited_once()
 
 
-def test_reject_relative_cwd_and_external_mcp():
+def test_reject_relative_cwd_and_invalid_mcp():
     with pytest.raises(ValueError, match="absolute"):
         asyncio.run(TradingSwarmSession.create(cwd="relative"))
-    with pytest.raises(ValueError, match="MCP"):
+    with pytest.raises(ValueError, match="MCP stdio command"):
         asyncio.run(TradingSwarmSession.create(mcp_servers={"unknown": {}}))
+
+
+def test_explicit_stdio_mcp_configuration(tmp_path):
+    async def run():
+        client = SimpleNamespace(create_session=AsyncMock(), stop=AsyncMock())
+        server = {"command": "/opt/market-mcp", "args": ["--stdio"], "env": {"MODE": "research"}}
+        with patch("copilot.CopilotClient", return_value=client):
+            await TradingSwarmSession.create(cwd=str(tmp_path), mcp_servers={"market": server})
+        kwargs = client.create_session.call_args.kwargs
+        assert "mcp:*" in kwargs["available_tools"].to_list()
+        assert kwargs["mcp_servers"]["market"] == {
+            **server, "type": "stdio", "tools": ["*"], "working_directory": str(tmp_path),
+        }
+    asyncio.run(run())
 
 
 def test_dated_evidence_preserves_ticker_and_cutoff():
@@ -169,6 +189,32 @@ def test_dated_evidence_preserves_ticker_and_cutoff():
 
 def test_tool_failure_is_explicit():
     invocation = SimpleNamespace(arguments={"topic": "news", "ticker": "AAPL", "as_of": "invalid"})
-    result = asyncio.run(_trading_tool().handler(invocation))
+    result = asyncio.run(_trading_tool({"as_of": "invalid"}).handler(invocation))
     assert result.result_type == "failure"
     assert "Evidence unavailable" in result.text_result_for_llm
+
+
+def test_user_cutoff_is_retained_for_followups():
+    async def run():
+        wrapper, _ = make_session()
+        await wrapper.prompt("Analyze AAPL as of 2026-01-02 using news since 2025-12-01")
+        await wrapper.prompt("Explain the risks")
+        assert wrapper._scope["as_of"] == "2026-01-02"
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scope", [{}, {"as_of": "2026-01-02"}])
+def test_model_cannot_choose_an_unapproved_cutoff(scope):
+    invocation = SimpleNamespace(
+        arguments={"topic": "news", "ticker": "AAPL", "as_of": "2026-02-01"},
+    )
+    with patch("tradingswarm.fleet._evidence") as evidence:
+        result = asyncio.run(_trading_tool(scope).handler(invocation))
+    assert result.result_type == "failure"
+    evidence.assert_not_called()
+
+
+def test_ambiguous_dates_require_explicit_cutoff():
+    wrapper, _ = make_session()
+    with pytest.raises(ValueError, match="one analysis cutoff"):
+        asyncio.run(wrapper.prompt("Compare 2025-01-01 and 2026-01-01"))

@@ -1,24 +1,62 @@
-"""TradingSwarm's text-only ACP adapter, using the official stdio transport."""
+"""TradingSwarm's baseline ACP adapter, using the official stdio transport."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import platform
+import re
 import sys
 from contextlib import redirect_stdout, suppress
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
-
-from acp import PROTOCOL_VERSION, Agent, RequestError, run_agent, schema as s
-from acp.stdio import stdio_streams
-from copilot import CopilotClient
-from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 
 from tradingswarm.fleet import TradingSwarmSession
 
 log = logging.getLogger(__name__)
+_INSTALL_HELP = 'TradingSwarm ACP requires Python 3.11+ and pip install "tradingswarm[acp]".'
+_DEPENDENCY_ERROR: ImportError | None = None
+
+try:
+    if sys.version_info < (3, 11):
+        raise ImportError(_INSTALL_HELP)
+    with redirect_stdout(sys.stderr):
+        from acp import PROTOCOL_VERSION, Agent, RequestError, run_agent, schema as s
+        from acp.router import MessageRouter
+        from acp.stdio import stdio_streams
+        from copilot import CopilotClient
+        from copilot.generated.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
+        from pydantic import field_validator
+except ImportError as exc:
+    # Importing the entry-point module must remain safe in a core-only installation.
+    _DEPENDENCY_ERROR = exc
+    Agent = object
+
+
+if _DEPENDENCY_ERROR is None:
+    class _StrictNewSessionRequest(s.NewSessionRequest):
+        @field_validator("mcp_servers", mode="wrap")
+        @classmethod
+        def _skip_invalid_items_1(cls, value: Any, handler: Any) -> Any:
+            # ACP 0.12.1 otherwise silently drops malformed MCP configurations.
+            return handler(value)
+
+
+def _require_dependencies() -> None:
+    if _DEPENDENCY_ERROR is not None:
+        raise ImportError(_INSTALL_HELP) from _DEPENDENCY_ERROR
+
+
+def _project_version() -> str:
+    try:
+        return version("tradingswarm")
+    except PackageNotFoundError:
+        return "0.5.0"
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -31,6 +69,60 @@ def _wire(obj: Any) -> Any:
 
 def _invalid(message: str) -> RequestError:
     return RequestError.invalid_params({"message": message})
+
+
+def _resource_context(block: s.ResourceContentBlock) -> str:
+    uri = block.uri
+    try:
+        parsed = urlsplit(uri)
+    except ValueError as exc:
+        raise _invalid("resource_link must contain a valid absolute URI") from exc
+    if (
+        not parsed.scheme or len(parsed.scheme) == 1
+        or any(character.isspace() or ord(character) < 32 for character in uri)
+        or (parsed.scheme == "file" and not parsed.path.startswith("/"))
+        or (parsed.scheme in ("http", "https") and not parsed.netloc)
+    ):
+        raise _invalid("resource_link must contain an absolute URI; use file:/// for filesystem paths")
+    context = {
+        key: value for key, value in {
+            "uri": uri, "name": block.name, "title": block.title,
+            "description": block.description, "mimeType": block.mime_type, "size": block.size,
+        }.items() if value is not None
+    }
+    return (
+        "Linked resource (reference metadata only; contents have not been fetched):\n"
+        + json.dumps(context, ensure_ascii=False)
+    )
+
+
+def _mcp_config(servers: list | None) -> dict[str, dict[str, Any]]:
+    configs = {}
+    for server in servers or []:
+        if not isinstance(server, s.McpServerStdio):
+            raise _invalid("Only client-configured stdio MCP servers are supported")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]+", server.name)
+            or server.name in configs
+        ):
+            raise _invalid("MCP server names must be nonempty, unique, and contain no wildcards")
+        if not Path(server.command).is_absolute() or "\0" in server.command:
+            raise _invalid("MCP stdio command must be an absolute executable path")
+        if any(not isinstance(arg, str) or "\0" in arg for arg in server.args):
+            raise _invalid("MCP arguments must be strings without NUL characters")
+        env = {}
+        for variable in server.env:
+            if (
+                not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable.name)
+                or variable.name in env or "\0" in variable.value
+            ):
+                raise _invalid("MCP environment names must be valid and unique; values cannot contain NUL")
+            env[variable.name] = variable.value
+        configs[server.name] = {
+            "type": "local", "command": server.command, "args": list(server.args),
+            "env": env, "tools": ["*"],
+        }
+    return configs
 
 
 @dataclass
@@ -48,6 +140,7 @@ class TradingSwarmAgent(Agent):
     """One persistent Copilot session per ACP session; no client filesystem access."""
 
     def __init__(self, model: str | None = None) -> None:
+        _require_dependencies()
         self.model = model
         self.connection: Any = None
         self.sessions: dict[str, _Session] = {}
@@ -56,6 +149,9 @@ class TradingSwarmAgent(Agent):
 
     def on_connect(self, conn: Any) -> None:
         self.connection = conn
+        router = getattr(getattr(conn, "_conn", None), "_handler", None)
+        if isinstance(router, MessageRouter):
+            router.route_request("session/new", _StrictNewSessionRequest, self, "new_session")
 
     async def initialize(
         self, protocol_version: int, client_capabilities: Any = None,
@@ -64,11 +160,14 @@ class TradingSwarmAgent(Agent):
         self.initialized = True
         return s.InitializeResponse(
             protocol_version=PROTOCOL_VERSION,
-            agent_info=s.Implementation(name="tradingswarm", version="0.1.0"),
+            agent_info=s.Implementation(name="tradingswarm", version=_project_version()),
             agent_capabilities=s.AgentCapabilities(),
             auth_methods=[s.AuthMethodAgent(
-                id="copilot-cli", name="Existing Copilot CLI login",
-                description="Run `copilot login` in a terminal, then retry. No tokens are collected.",
+                id="copilot-cli", name="Existing Copilot authentication",
+                description=(
+                    "Use `copilot login` or COPILOT_GITHUB_TOKEN in the server environment. "
+                    "No tokens are collected through ACP."
+                ),
             )],
         )
 
@@ -86,7 +185,7 @@ class TradingSwarmAgent(Agent):
         self._ready()
         if method_id != "copilot-cli":
             raise _invalid("Unsupported authentication method")
-        client = CopilotClient(use_logged_in_user=True)
+        client = CopilotClient()
         try:
             await client.start()
             status = await client.get_auth_status()
@@ -113,8 +212,7 @@ class TradingSwarmAgent(Agent):
         self._ready()
         if not Path(cwd).is_absolute() or not Path(cwd).is_dir():
             raise _invalid("cwd must be an existing absolute directory")
-        if mcp_servers:
-            raise _invalid("Client-supplied MCP servers are unsupported; use the built-in trading tools")
+        mcp_config = _mcp_config(mcp_servers)
         if additional_directories:
             raise _invalid("Additional directories are unsupported")
         await self.authenticate("copilot-cli")
@@ -126,6 +224,7 @@ class TradingSwarmAgent(Agent):
         try:
             runtime = await TradingSwarmSession.create(
                 model=self.model, cwd=cwd, on_permission_request=permission,
+                mcp_servers=mcp_config,
             )
         except Exception as exc:
             log.warning("Copilot session creation failed: %s", type(exc).__name__)
@@ -225,9 +324,14 @@ class TradingSwarmAgent(Agent):
         self, session_id: str, prompt: list, **kwargs: Any,
     ) -> s.PromptResponse:
         state = self._session(session_id)
-        if not prompt or any(not isinstance(block, s.TextContentBlock) for block in prompt):
-            raise _invalid("Only nonempty text prompts are supported")
-        text = "\n".join(block.text for block in prompt).strip()
+        if not prompt or any(
+            not isinstance(block, (s.TextContentBlock, s.ResourceContentBlock)) for block in prompt
+        ):
+            raise _invalid("Only text and resource_link prompt content is supported")
+        text = "\n".join(
+            block.text if isinstance(block, s.TextContentBlock) else _resource_context(block)
+            for block in prompt
+        ).strip()
         fleet = state.mode == "fleet"
         if text.startswith("/"):
             command, *arguments = text.split(maxsplit=1)
@@ -417,17 +521,35 @@ class TradingSwarmAgent(Agent):
 
 async def serve(model: str | None = None) -> None:
     agent = TradingSwarmAgent(model=model)
+    protocol_stdout = sys.stdout
     reader, writer = await stdio_streams()
+    if platform.system() == "Windows":
+        # ACP 0.12.1's Windows transport resolves sys.stdout on every write.
+        # Bind this transport instance before redirecting runtime diagnostics.
+        transport = writer.transport
+        protocol_buffer = protocol_stdout.buffer
+
+        def write_protocol(data: bytes) -> None:
+            if not transport.is_closing():
+                protocol_buffer.write(data)
+                protocol_buffer.flush()
+
+        transport.write = write_protocol
     # Capture the protocol's stdout pipe first; vendor tool prints are diagnostics.
     with redirect_stdout(sys.stderr):
         try:
-            await run_agent(agent, writer, reader)
+            await run_agent(agent, input_stream=writer, output_stream=reader)
         finally:
             await agent.shutdown()
 
 
 def main() -> None:
     logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+    try:
+        _require_dependencies()
+    except ImportError:
+        print(_INSTALL_HELP, file=sys.stderr)
+        raise SystemExit(1) from None
     with suppress(KeyboardInterrupt):
         asyncio.run(serve())
 

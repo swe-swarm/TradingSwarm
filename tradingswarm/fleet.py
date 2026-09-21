@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import suppress
 from datetime import date, timedelta
 from pathlib import Path
@@ -45,6 +46,34 @@ _ROLES = {
     "risk": "Review the proposed decision for uncertainty, downside and portfolio risk.",
 }
 
+_ORCHESTRATION_TOOLS = [
+    "task", "sql", "read_agent", "write_agent", "list_agents", "task_complete",
+]
+
+
+def _mcp_config(servers, directory):
+    configured = {}
+    for name, server in (servers or {}).items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ValueError("MCP server names must contain only letters, digits, '_' or '-'")
+        if server.get("type", "stdio") not in {"local", "stdio"}:
+            raise ValueError("Only stdio MCP servers are supported")
+        command = server.get("command")
+        if not isinstance(command, str) or not Path(command).is_absolute():
+            raise ValueError("MCP stdio command must be an absolute executable path")
+        args, env = server.get("args", []), server.get("env", {})
+        if not isinstance(args, list) or any(not isinstance(arg, str) for arg in args):
+            raise ValueError("MCP arguments must be strings")
+        if not isinstance(env, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str) for key, value in env.items()
+        ):
+            raise ValueError("MCP environment must map names to string values")
+        configured[name] = {
+            "type": "stdio", "command": command, "args": args, "env": env,
+            "tools": ["*"], "working_directory": str(directory),
+        }
+    return configured
+
 
 def _evidence(topic: str, ticker: str, as_of: str) -> str:
     from tradingagents.agents.utils import agent_utils
@@ -70,12 +99,16 @@ def _evidence(topic: str, ticker: str, as_of: str) -> str:
     raise ValueError(f"Unknown evidence topic: {topic}")
 
 
-def _trading_tool():
+def _trading_tool(scope):
     from copilot.tools import Tool, ToolResult
 
     async def handler(invocation):
         try:
             args = invocation.arguments
+            if not scope.get("as_of"):
+                raise ValueError("Ask the user for an explicit analysis date: 'as of YYYY-MM-DD'")
+            if args.get("as_of") != scope["as_of"]:
+                raise ValueError(f"Evidence must use the user's analysis date {scope['as_of']}")
             result = await asyncio.to_thread(_evidence, **args)
             return ToolResult(text_result_for_llm=str(result))
         except Exception as exc:
@@ -105,11 +138,12 @@ def _trading_tool():
 class TradingSwarmSession:
     """A persistent GitHub-authenticated session shared by CLI and ACP clients."""
 
-    def __init__(self, client, session):
+    def __init__(self, client, session, scope=None):
         self.client = client
         self.session = session
         self._lock = asyncio.Lock()
         self._closed = False
+        self._scope = scope if scope is not None else {}
 
     @classmethod
     async def create(cls, model=None, cwd=None, on_permission_request=None, mcp_servers=None):
@@ -124,13 +158,16 @@ class TradingSwarmSession:
         directory = Path(cwd or Path.cwd())
         if not directory.is_absolute() or not directory.is_dir():
             raise ValueError("cwd must be an existing absolute directory")
-        if mcp_servers:
-            raise ValueError("External MCP servers are not enabled for trading sessions")
+        servers = _mcp_config(mcp_servers, directory)
+        allowed = ToolSet().add_builtin(_ORCHESTRATION_TOOLS).add_custom("trading_evidence")
+        if servers:
+            allowed.add_mcp("*")
 
         def deny_permission(request, invocation):
             return PermissionDecisionReject()
 
         client = CopilotClient(working_directory=str(directory))
+        scope = {}
         try:
             creating = client.create_session(
                 model=model,
@@ -139,9 +176,8 @@ class TradingSwarmSession:
                 streaming=True,
                 include_sub_agent_streaming_events=True,
                 system_message={"mode": "append", "content": FLEET_INSTRUCTIONS},
-                tools=[_trading_tool()],
-                available_tools=ToolSet().add_builtin(["task", "sql"]).add_custom("trading_evidence"),
-                excluded_tools=ToolSet().add_mcp("*"),
+                tools=[_trading_tool(scope)],
+                available_tools=allowed,
                 custom_agents=[
                     {
                         "name": f"tradingswarm-{name}",
@@ -157,14 +193,19 @@ class TradingSwarmSession:
                 enable_file_hooks=False,
                 enable_host_git_operations=False,
                 enable_skills=False,
+                enable_session_store=False,
+                enable_on_demand_instruction_discovery=False,
                 custom_agents_local_only=True,
-                mcp_servers={},
+                excluded_builtin_agents=[
+                    "explore", "task", "general-purpose", "code-review", "research", "security-review",
+                ],
+                mcp_servers=servers,
             )
             session = await asyncio.wait_for(creating, timeout=60)
         except BaseException:
             await cls._stop_client(client)
             raise
-        return cls(client, session)
+        return cls(client, session, scope)
 
     @staticmethod
     async def _stop_client(client):
@@ -188,6 +229,16 @@ class TradingSwarmSession:
             text = arguments[0].strip() if arguments else ""
             if not text:
                 raise ValueError("/fleet requires a research prompt")
+        cutoffs = set(re.findall(r"\bas\s+of\s+(\d{4}-\d{2}-\d{2})\b", text, re.IGNORECASE))
+        if not cutoffs:
+            cutoffs = set(re.findall(r"\b\d{4}-\d{2}-\d{2}\b", text))
+        if len(cutoffs) > 1:
+            raise ValueError("Specify one analysis cutoff as 'as of YYYY-MM-DD'")
+        if cutoffs:
+            cutoff = cutoffs.pop()
+            if date.fromisoformat(cutoff) > date.today():
+                raise ValueError("The analysis date cannot be in the future")
+            self._scope["as_of"] = cutoff
         async with self._lock:
             messages = []
             errors = []
