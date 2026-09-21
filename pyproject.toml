@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tradingagents"
+name = "tradingswarm"
 version = "0.5.0"
-description = "TradingAgents: Multi-Agents LLM Financial Trading Framework"
+description = "TradingSwarm: multi-agent trading research with GitHub Copilot and ACP"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -28,6 +28,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+copilot = [
+    "github-copilot-sdk==1.0.14; python_version >= '3.11'",
+]
+acp = [
+    "github-copilot-sdk==1.0.14; python_version >= '3.11'",
+    "agent-client-protocol==0.12.1; python_version >= '3.11'",
+]
 dev = [
     "ruff>=0.15",
     "pytest>=8.0",
@@ -40,10 +47,12 @@ bedrock = [
 ]
 
 [project.scripts]
+tradingswarm = "cli.main:app"
+tradingswarm-acp = "tradingswarm.acp:main"
 tradingagents = "cli.main:app"
 
 [tool.setuptools.packages.find]
-include = ["tradingagents*", "cli*"]
+include = ["tradingswarm*", "tradingagents*", "cli*"]
 
 [tool.setuptools.package-data]
 cli = ["static/*"]

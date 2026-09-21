@@ -1,5 +1,4 @@
 import datetime
-import os
 import sys
 import time
 from collections import deque
@@ -45,7 +44,7 @@ from cli.utils import (
 from tradingagents.agents.utils.rating import is_review
 from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.dataflows.utils import safe_ticker_component
-from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.default_config import DEFAULT_CONFIG, config_env
 from tradingagents.graph.analyst_execution import (
     AnalystWallTimeTracker,
     build_analyst_execution_plan,
@@ -71,8 +70,8 @@ else:
     _NO_CONSOLE_ERRORS = ()
 
 app = typer.Typer(
-    name="TradingAgents",
-    help="TradingAgents CLI: Multi-Agents LLM Financial Trading Framework",
+    name="TradingSwarm",
+    help="TradingSwarm CLI: multi-agent financial research with GitHub Copilot and ACP",
     add_completion=True,  # Enable shell completion
 )
 
@@ -294,9 +293,9 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
     # Header with welcome message
     layout["header"].update(
         Panel(
-            "[bold green]Welcome to TradingAgents CLI[/bold green]\n"
+            "[bold green]Welcome to TradingSwarm CLI[/bold green]\n"
             "[dim]© [Tauric Research](https://github.com/TauricResearch)[/dim]",
-            title="Welcome to TradingAgents",
+            title="Welcome to TradingSwarm",
             border_style="green",
             padding=(1, 2),
             expand=True,
@@ -512,7 +511,7 @@ def _prompt_selections(prefs):
 
     # Create welcome box content
     welcome_content = f"{welcome_ascii}\n"
-    welcome_content += "[bold green]TradingAgents: Multi-Agents LLM Financial Trading Framework - CLI[/bold green]\n\n"
+    welcome_content += "[bold green]TradingSwarm: Multi-Agents LLM Financial Trading Framework - CLI[/bold green]\n\n"
     welcome_content += "[bold]Workflow Steps:[/bold]\n"
     welcome_content += "I. Analyst Team → II. Research Team → III. Trader → IV. Risk Management → V. Portfolio Management\n\n"
     welcome_content += (
@@ -524,7 +523,7 @@ def _prompt_selections(prefs):
         welcome_content,
         border_style="green",
         padding=(1, 2),
-        title="Welcome to TradingAgents",
+        title="Welcome to TradingSwarm",
         subtitle="Multi-Agents LLM Financial Trading Framework",
     )
     console.print(Align.center(welcome_box))
@@ -550,7 +549,7 @@ def _prompt_selections(prefs):
         the env overlay placed on DEFAULT_CONFIG is used — mirroring the
         env-precedence rule applied to the other selection steps.
         """
-        if os.environ.get(env_var):
+        if config_env(env_var):
             value = DEFAULT_CONFIG[config_key]
             console.print(f"[green]✓ {label} from environment:[/green] {value}")
             return value
@@ -586,7 +585,7 @@ def _prompt_selections(prefs):
     analysis_date = get_analysis_date()
 
     # Step 3: Output language (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE)
-    if os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
+    if config_env("TRADINGAGENTS_OUTPUT_LANGUAGE"):
         output_language = DEFAULT_CONFIG["output_language"]
         console.print(
             f"[green]✓ Output language from environment:[/green] {output_language}"
@@ -616,8 +615,8 @@ def _prompt_selections(prefs):
     # Research depth maps to the debate + risk round counts; when both are
     # supplied through TRADINGAGENTS_MAX_DEBATE_ROUNDS / _MAX_RISK_ROUNDS we keep
     # the run non-interactive and honor the env values (#977).
-    depth_from_env = bool(os.environ.get("TRADINGAGENTS_MAX_DEBATE_ROUNDS")) and bool(
-        os.environ.get("TRADINGAGENTS_MAX_RISK_ROUNDS")
+    depth_from_env = bool(config_env("TRADINGAGENTS_MAX_DEBATE_ROUNDS")) and bool(
+        config_env("TRADINGAGENTS_MAX_RISK_ROUNDS")
     )
     if depth_from_env:
         selected_research_depth = DEFAULT_CONFIG["max_debate_rounds"]
@@ -638,7 +637,7 @@ def _prompt_selections(prefs):
     # The backend URL comes from TRADINGAGENTS_LLM_BACKEND_URL when set,
     # otherwise the provider's default endpoint — the same value the menu
     # would have picked.
-    provider_from_env = bool(os.environ.get("TRADINGAGENTS_LLM_PROVIDER"))
+    provider_from_env = bool(config_env("TRADINGAGENTS_LLM_PROVIDER"))
     if provider_from_env:
         selected_llm_provider = DEFAULT_CONFIG["llm_provider"].lower()
         backend_url = resolve_backend_url(
@@ -690,7 +689,7 @@ def _prompt_selections(prefs):
         ensure_api_key(selected_llm_provider)
 
     # Step 7: Thinking agents (skipped when either model is set via environment)
-    if os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM") or os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM"):
+    if config_env("TRADINGAGENTS_QUICK_THINK_LLM") or config_env("TRADINGAGENTS_DEEP_THINK_LLM"):
         selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
         selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
         console.print(
@@ -1021,7 +1020,7 @@ def _build_run_config(selections: dict, checkpoint: bool | None) -> dict:
     # interactive selection — leave the env-applied value in place (#977).
     for env_var, key in (("TRADINGAGENTS_MAX_DEBATE_ROUNDS", "max_debate_rounds"),
                          ("TRADINGAGENTS_MAX_RISK_ROUNDS", "max_risk_discuss_rounds")):
-        if os.environ.get(env_var):
+        if config_env(env_var):
             # The depth prompt still appeared (it is skipped only when both are
             # set), so say which half of the answer the environment overrode.
             console.print(
@@ -1405,6 +1404,44 @@ def analyze(
             err=True,
         )
         raise typer.Exit(code=1) from None
+
+
+@app.command()
+def fleet(
+    prompt: str = typer.Argument(..., help="Research scope, including ticker and analysis date."),
+    model: str | None = typer.Option(None, help="GitHub Copilot model ID; unset uses its default."),
+    timeout: float = typer.Option(300.0, min=1.0, help="Maximum run time in seconds."),
+):
+    """Coordinate TradingSwarm specialists with Copilot's native /fleet mode."""
+    import asyncio
+
+    from tradingswarm.fleet import TradingSwarmSession, event_summary
+
+    async def run():
+        session = await TradingSwarmSession.create(model=model)
+        try:
+            def on_event(event):
+                summary = event_summary(event)
+                if summary:
+                    print(summary, file=sys.stderr)
+
+            return await session.prompt(prompt, fleet=True, on_event=on_event, timeout=timeout)
+        finally:
+            await session.close()
+
+    try:
+        console.print(Markdown(asyncio.run(run())))
+    except (ImportError, RuntimeError, ValueError, TimeoutError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
+def acp():
+    """Serve TradingSwarm over Agent Client Protocol on stdio."""
+    from tradingswarm.acp import main
+
+    main()
 
 
 @app.command()
