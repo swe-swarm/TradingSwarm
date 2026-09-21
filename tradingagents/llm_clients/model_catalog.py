@@ -94,6 +94,8 @@ _MINIMAX_MODELS: dict[str, list[ModelOption]] = {
 
 
 MODEL_OPTIONS: ProviderModeOptions = {
+    "copilot": _CUSTOM_ONLY,
+    "github": _CUSTOM_ONLY,
     "openai": {
         "quick": [
             ("GPT-5.6 Luna - Fast, cost-efficient frontier", "gpt-5.6-luna"),

@@ -1,33 +1,140 @@
-<p align="center">
-  <img src="assets/TauricResearch.png" style="width: 60%; height: auto;">
-</p>
+# TradingSwarm: Multi-Agent Financial Research
 
-<div align="center" style="line-height: 1;">
-  <a href="https://arxiv.org/abs/2412.20138" target="_blank"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2412.20138-B31B1B?logo=arxiv"/></a>
-  <a href="https://discord.com/invite/hk9PGKShPK" target="_blank"><img alt="Discord" src="https://img.shields.io/badge/Discord-TradingResearch-7289da?logo=discord&logoColor=white&color=7289da"/></a>
-  <a href="https://x.com/TauricResearch" target="_blank"><img alt="X Follow" src="https://img.shields.io/badge/X-TauricResearch-white?logo=x&logoColor=white"/></a>
-  <a href="https://github.com/TauricResearch/" target="_blank"><img alt="Community" src="https://img.shields.io/badge/GitHub_Community-TauricResearch-14C290?logo=discourse"/></a>
-</div>
-<br>
-<div align="center">
-  <a href="https://github.com/TauricResearch" target="_blank"><img alt="TradingAgents #1 Repository of the Day" src="https://trendshift.io/api/badge/repositories/16192" width="250" height="55"/></a>
-</div>
-<br>
-<div align="center">
-  <!-- Keep these links. Translations will automatically update with the README. -->
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=de">Deutsch</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=es">Español</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=fr">français</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=ja">日本語</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=ko">한국어</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=pt">Português</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=ru">Русский</a> | 
-  <a href="https://www.readme-i18n.com/TauricResearch/TradingAgents?lang=zh">中文</a>
-</div>
+TradingSwarm is the [swe-swarm fork](https://github.com/swe-swarm/TradingSwarm)
+of [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents).
+It preserves the original trading research engine and adds GitHub Copilot as a
+model provider, native Copilot fleet orchestration, and an Agent Client Protocol
+(ACP) stdio agent. Upstream attribution, research references and license are retained.
 
----
+## TradingSwarm quick start
 
-# TradingAgents: Multi-Agents LLM Financial Trading Framework
+```bash
+git clone https://github.com/swe-swarm/TradingSwarm.git
+cd TradingSwarm
+python -m pip install -e ".[dev]"
+tradingswarm --help
+```
+
+The core supports Python 3.10+. Copilot and ACP integration require **Python
+3.11+**:
+
+```bash
+python -m pip install -e ".[acp]"
+```
+
+This pins `github-copilot-sdk==1.0.14` and `agent-client-protocol==0.12.1`.
+The SDK's published runtime pin is **Copilot CLI 1.0.85**; its runtime downloader
+uses that version. If supplying `COPILOT_CLI_PATH`, use the same runtime version.
+Fleet is experimental: upgrade the SDK and runtime together and rerun the protocol
+tests. A GitHub account with Copilot access and an authenticated Copilot CLI
+(`copilot login`), or the SDK-supported `COPILOT_GITHUB_TOKEN`, is required.
+Never put tokens in source, prompts, or ACP messages. Model availability and billing
+follow your GitHub account; this is not a GitHub Models/OpenAI-compatible endpoint.
+
+### GitHub model provider
+
+Select **GitHub Copilot** in the provider menu, or configure:
+
+```bash
+export TRADINGSWARM_LLM_PROVIDER=copilot
+export TRADINGSWARM_QUICK_THINK_LLM=gpt-4.1
+export TRADINGSWARM_DEEP_THINK_LLM=gpt-4.1
+tradingswarm
+```
+
+Use model IDs available to your Copilot account. `github` is a provider alias.
+The existing LangGraph workflow remains available with every previous provider.
+
+```python
+from tradingswarm import DEFAULT_CONFIG, TradingSwarmGraph
+
+config = DEFAULT_CONFIG.copy()
+config.update(llm_provider="copilot", quick_think_llm="gpt-4.1", deep_think_llm="gpt-4.1")
+graph = TradingSwarmGraph(config=config)
+state, decision = graph.propagate("NVDA", "2026-01-02")
+```
+
+### Native fleet mode
+
+```bash
+tradingswarm fleet "Analyze NVDA as of 2026-01-02; reconcile the evidence and risks"
+```
+
+This calls `session.rpc.fleet.start(FleetStartRequest(..., wait=True))`, not a
+simulated parallel loop. One persistent parent session coordinates market,
+fundamentals, news and sentiment workers, followed by dependent bull/bear
+research, trading and risk review. The orchestration instructions use the runtime
+`sql` tool's `todos`/`todo_deps` coordination state and
+`pending → in_progress → done/blocked` lifecycle. These instructions guide the
+runtime; they are not a separate application scheduler or a stable SDK SQL API.
+The parent reconciles worker reports before returning its answer.
+
+The SDK session event stream exposes `subagent.*` activity. CLI lifecycle messages
+go to stderr. Financial evidence uses the existing dated data vendors; sentiment
+currently uses news evidence, not invented social posts. Missing historical data
+must be reported, not filled in. Fleet is a separate research workflow, not a
+replacement for LangGraph's checkpoint, backtest, portfolio or decision-log APIs.
+Built-in TradingSwarm tools never place orders. Only session orchestration tools (`task`, `sql`,
+`read_agent`, `write_agent`, `list_agents`, `task_complete`) and read-only
+`trading_evidence` are enabled. Evidence is bound to the user's explicit
+`as of YYYY-MM-DD` cutoff (or the sole ISO date in a prompt), retained across
+follow-up turns. Ambiguous dates require clarification; model-supplied dates
+cannot override the cutoff. Local shell/file tools, discovered instructions, skills and file
+hooks are disabled. ACP clients may explicitly configure stdio MCP servers;
+their tools are additionally available to the parent session and subject to
+permission handling. This deliberately grants the configured executable access
+to the agent's host environment: only configure trusted MCP servers.
+Cancellation stops the agent turn, but an already-running synchronous vendor
+request may finish in its background thread.
+
+### Agent Client Protocol
+
+Configure an ACP-compatible client to launch:
+
+```json
+{
+  "command": "tradingswarm-acp",
+  "args": []
+}
+```
+
+`tradingswarm acp` is an equivalent entry point. The official ACP SDK handles
+newline-delimited JSON-RPC 2.0 on stdin/stdout; diagnostics belong on stderr.
+Use an **absolute existing directory** for `session/new.cwd`. Initialize first,
+create a session, then send text and resource-link prompts through `session/prompt`.
+Resource links are references, not permission to fetch URLs or read files. Each session
+retains its Copilot conversation. Choose the `fleet` session mode or send
+`/fleet Analyze NVDA as of 2026-01-02` to start native orchestration.
+`session/cancel` aborts active work. Runtime permission requests require explicit
+client approval; absent or invalid responses do not grant access.
+
+Capabilities are negotiated, not assumed. This integration is a text research
+agent: it does not advertise image/audio input, client filesystem/terminal
+operations or persistent session loading. Client-provided stdio MCP servers are
+supported; executable paths must be absolute, with unique server/environment
+names. HTTP/SSE MCP transports are not advertised or accepted. Unsupported features return protocol
+errors. Authentication uses the existing Copilot login outside ACP. Generic SDK
+events, rather than nonexistent dedicated SDK subagent hooks, carry lifecycle
+activity. Plugin sub-agents are not registered by this adapter.
+
+### Compatibility and validation
+
+- `tradingagents` imports and the `tradingagents` command remain compatible.
+  New code can use `from tradingswarm import DEFAULT_CONFIG, TradingSwarmGraph`.
+  Internal engine modules retain their legacy paths to avoid duplicate module state.
+- Every existing `TRADINGAGENTS_*` configuration override also accepts
+  `TRADINGSWARM_*`; a nonempty new value takes precedence, including CLI prompt
+  skipping and path overrides.
+- New installations use `~/.tradingswarm`. An existing `~/.tradingagents`
+  directory is reused so checkpoints, memory and preferences remain accessible.
+- Docker commands use the `tradingswarm` and `tradingswarm-ollama` services.
+  The existing named data volume is retained. The base image installs the core;
+  Copilot/ACP need the optional extras and pinned runtime in a custom image.
+- Run `pytest -q` and `ruff check .`. Protocol tests use mocked model responses
+  and real SDK schemas, so they do not consume paid inference.
+
+The upstream documentation and release history below describe the retained
+TradingAgents engine.
 
 ## News
 - [2026-09] **TradingAgents v0.5.0** released with point-in-time integrity across every dated path, SEC EDGAR fundamentals served as filed, backtesting over a ticker and date grid, portfolio-aware runs, and current model lineups across every provider. See [CHANGELOG.md](CHANGELOG.md) for the full list.
@@ -107,8 +214,8 @@ Our framework decomposes complex trading tasks into specialized roles.
 
 Clone TradingAgents:
 ```bash
-git clone https://github.com/TauricResearch/TradingAgents.git
-cd TradingAgents
+git clone https://github.com/swe-swarm/TradingSwarm.git
+cd TradingSwarm
 ```
 
 Create a virtual environment in any of your favorite environment managers:
@@ -133,14 +240,14 @@ pip install .
 Alternatively, run with Docker:
 ```bash
 cp .env.example .env  # add your API keys
-docker compose run --rm tradingagents
+docker compose run --rm tradingswarm
 ```
 
 After updating the repository, rebuild the image with `docker compose build`.
 
 For local models with Ollama:
 ```bash
-docker compose --profile ollama run --rm tradingagents-ollama
+docker compose --profile ollama run --rm tradingswarm-ollama
 ```
 
 ### Required APIs

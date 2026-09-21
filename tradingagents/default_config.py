@@ -1,6 +1,10 @@
 import os
 
-_TRADINGAGENTS_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
+_LEGACY_HOME = os.path.join(os.path.expanduser("~"), ".tradingagents")
+_TRADINGAGENTS_HOME = (
+    _LEGACY_HOME if os.path.isdir(_LEGACY_HOME)
+    else os.path.join(os.path.expanduser("~"), ".tradingswarm")
+)
 
 # Single source of truth for env-var → config-key overrides. To expose
 # a new config key for environment-based override, add a row here — no
@@ -33,6 +37,12 @@ _BOOL_TRUE = ("true", "1", "yes", "on")
 _BOOL_FALSE = ("false", "0", "no", "off")
 
 
+def config_env(name: str, default=None):
+    """Prefer TRADINGSWARM settings, retaining nonempty legacy values as fallback."""
+    current = name.replace("TRADINGAGENTS_", "TRADINGSWARM_", 1)
+    return os.environ.get(current) or os.environ.get(name) or default
+
+
 def _coerce(value: str, reference):
     """Coerce env-var string to the type of the existing default value.
 
@@ -57,23 +67,25 @@ def _coerce(value: str, reference):
 
 
 def _apply_env_overrides(config: dict) -> dict:
-    """Apply TRADINGAGENTS_* env vars to the config dict in-place."""
+    """Apply current and legacy environment settings to the config in-place."""
     for env_var, key in _ENV_OVERRIDES.items():
-        raw = os.environ.get(env_var)
+        raw = config_env(env_var)
         if raw is None or raw == "":
             continue
         try:
             config[key] = _coerce(raw, config.get(key))
         except ValueError as exc:
-            raise ValueError(f"Invalid value for {env_var}: {exc}") from exc
+            current = env_var.replace("TRADINGAGENTS_", "TRADINGSWARM_", 1)
+            source = current if os.environ.get(current) else env_var
+            raise ValueError(f"Invalid value for {source}: {exc}") from exc
     return config
 
 
 DEFAULT_CONFIG = _apply_env_overrides({
     "project_dir": os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),
-    "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR", os.path.join(_TRADINGAGENTS_HOME, "logs")),
-    "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR", os.path.join(_TRADINGAGENTS_HOME, "cache")),
-    "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH", os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md")),
+    "results_dir": config_env("TRADINGAGENTS_RESULTS_DIR", os.path.join(_TRADINGAGENTS_HOME, "logs")),
+    "data_cache_dir": config_env("TRADINGAGENTS_CACHE_DIR", os.path.join(_TRADINGAGENTS_HOME, "cache")),
+    "memory_log_path": config_env("TRADINGAGENTS_MEMORY_LOG_PATH", os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md")),
     # Optional cap on the number of resolved memory log entries. When set,
     # the oldest resolved entries are pruned once this limit is exceeded.
     # Pending entries are never pruned. None disables rotation entirely.

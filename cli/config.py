@@ -1,6 +1,6 @@
 CLI_CONFIG = {
     # Announcements
-    "announcements_url": "https://api.tauric.ai/v1/announcements",
+    "announcements_url": None,
     "announcements_timeout": 1.0,
-    "announcements_fallback": "[cyan]For more information, please visit[/cyan] [link=https://github.com/TauricResearch]https://github.com/TauricResearch[/link]",
+    "announcements_fallback": "[cyan]TradingSwarm[/cyan] — [link=https://github.com/swe-swarm/TradingSwarm]https://github.com/swe-swarm/TradingSwarm[/link]",
 }

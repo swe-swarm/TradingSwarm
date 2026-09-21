@@ -28,6 +28,10 @@ def create_llm_client(
     """
     provider_lower = provider.lower()
 
+    if provider_lower in ("copilot", "github"):
+        from .copilot_client import CopilotClient
+        return CopilotClient(model, base_url, **kwargs)
+
     # Native (non-OpenAI) APIs are matched first so their string check doesn't
     # import the OpenAI client. Everything else is OpenAI-compatible and routes
     # through the provider registry (single source of truth).
